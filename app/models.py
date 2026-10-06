@@ -30,6 +30,34 @@ class CarryoverStatus(str, enum.Enum):
     REJECTED = "rejected"
 
 
+class BatchAcquisitionMethod(str, enum.Enum):
+    ANNUAL_ISSUE = "annual_issue"       # 当年核发
+    CARRYOVER = "carryover"             # 历年结转
+    MARKET_PURCHASE = "market_purchase"  # 市场购入
+    RETURN = "return"                    # 退回到已过期父批次后形成的恢复批次
+
+
+class BatchStatus(str, enum.Enum):
+    ACTIVE = "active"
+    EXHAUSTED = "exhausted"
+    EXPIRED = "expired"
+
+
+class AllocationPurpose(str, enum.Enum):
+    RESERVE = "reserve"        # 挂单预留（冻结）
+    FULFILLMENT = "fulfillment"  # 年度履约
+    SELL = "sell"              # 出售成交
+    CARRYOVER = "carryover"    # 结转出库
+    RETURN = "return"          # 退回恢复
+
+
+class AllocationStatus(str, enum.Enum):
+    HELD = "held"
+    CONSUMED = "consumed"
+    RELEASED = "released"
+    RESTORED = "restored"
+
+
 class Enterprise(Base):
     __tablename__ = "enterprises"
 
@@ -236,3 +264,141 @@ class AnnualCreditSummary(Base):
     __table_args__ = (
         {'sqlite_autoincrement': True},
     )
+
+
+class CreditBatch(Base):
+    """积分批次：企业持有的每一批可追踪积分。
+
+    数量守恒（对任一批次，忽略浮点误差后恒成立）：
+        original_amount = remaining_amount + frozen_amount
+                          + consumed_amount + expired_amount
+    其中 remaining 为可用，frozen 为预留给未完成交易的数量。
+    """
+    __tablename__ = "credit_batches"
+
+    id = Column(Integer, primary_key=True, index=True)
+    batch_no = Column(String(50), unique=True, nullable=False, index=True)
+    enterprise_id = Column(Integer, ForeignKey("enterprises.id"), nullable=False, index=True)
+    source_year = Column(Integer, nullable=False, comment="来源年度（核发年度或购入/结转发生年度）")
+    origin_year = Column(Integer, nullable=False, comment="最初核发年度，沿来源链追溯")
+    acquisition_method = Column(Enum(BatchAcquisitionMethod), nullable=False, comment="取得方式")
+    original_amount = Column(Float, nullable=False, comment="批次原始数量")
+    remaining_amount = Column(Float, nullable=False, default=0.0, comment="可用（未冻结/未消耗/未过期）数量")
+    frozen_amount = Column(Float, nullable=False, default=0.0, comment="预留给未完成交易的数量")
+    consumed_amount = Column(Float, nullable=False, default=0.0, comment="已消耗（履约/出售/结转）数量")
+    expired_amount = Column(Float, nullable=False, default=0.0, comment="已过期数量")
+    valid_from = Column(DateTime, nullable=False, comment="适用期限起")
+    valid_until = Column(DateTime, nullable=False, comment="适用期限止")
+    status = Column(Enum(BatchStatus), default=BatchStatus.ACTIVE, nullable=False)
+    rule_version = Column(String(20), nullable=False, default="v1", comment="选批规则版本")
+    origin_ref_type = Column(String(30), comment="来源单据类型：credit_record/transaction/carryover")
+    origin_ref_id = Column(Integer, comment="来源单据ID")
+    parent_batch_id = Column(Integer, ForeignKey("credit_batches.id"), nullable=True, comment="退回批次的直接父批次")
+    remark = Column(String(500))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    parent_batch = relationship("CreditBatch", remote_side=[id], foreign_keys=[parent_batch_id])
+    # 本批次作为「子」时的链（指向其父亲）；本批次作为「父」时的链（指向其派生子女）
+    links_as_child = relationship(
+        "CreditBatchLink", foreign_keys="CreditBatchLink.child_batch_id", back_populates="child_batch"
+    )
+    links_as_parent = relationship(
+        "CreditBatchLink", foreign_keys="CreditBatchLink.parent_batch_id", back_populates="parent_batch"
+    )
+
+
+class CreditBatchLink(Base):
+    """批次来源链：结转形成的新批次（child）由哪些父批次按多少数量构成。"""
+    __tablename__ = "credit_batch_links"
+
+    id = Column(Integer, primary_key=True, index=True)
+    parent_batch_id = Column(Integer, ForeignKey("credit_batches.id"), nullable=False, index=True)
+    child_batch_id = Column(Integer, ForeignKey("credit_batches.id"), nullable=False, index=True)
+    parent_amount = Column(Float, nullable=False, comment="父批次出库数量（结转前）")
+    child_amount = Column(Float, nullable=False, comment="分摊到子批次的数量（结转后）")
+    carryover_ratio = Column(Float, nullable=False, comment="该段结转比例")
+    carryover_id = Column(Integer, ForeignKey("credit_carryovers.id"), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    parent_batch = relationship(
+        "CreditBatch", foreign_keys=[parent_batch_id], back_populates="links_as_child"
+    )
+    child_batch = relationship(
+        "CreditBatch", foreign_keys=[child_batch_id], back_populates="links_as_parent"
+    )
+
+
+class CreditBatchSelectionGroup(Base):
+    """一次消费/预留的选批结果与理由（可解释、可按版本重放）。"""
+    __tablename__ = "credit_batch_selection_groups"
+
+    id = Column(Integer, primary_key=True, index=True)
+    group_no = Column(String(50), unique=True, nullable=False, index=True)
+    enterprise_id = Column(Integer, ForeignKey("enterprises.id"), nullable=False, index=True)
+    purpose = Column(Enum(AllocationPurpose), nullable=False)
+    amount = Column(Float, nullable=False, comment="需求数量")
+    rule_version = Column(String(20), nullable=False)
+    ref_type = Column(String(30), comment="关联单据类型：order/transaction/carryover/fulfillment")
+    ref_id = Column(Integer, comment="关联单据ID")
+    ref_no = Column(String(50), comment="关联单据号")
+    candidates_snapshot = Column(Text, comment="选批前候选批次快照(JSON)")
+    reason_summary = Column(Text, comment="选择理由汇总")
+    replayed = Column(Boolean, default=False, comment="是否为历史重放产生")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    allocations = relationship(
+        "CreditBatchAllocation", back_populates="group", cascade="all, delete-orphan"
+    )
+
+
+class CreditBatchAllocation(Base):
+    """批次分配行：某个批次向某次消费贡献了多少数量，以及该行当前状态。
+
+    reserve（挂单预留）：held；成交后转 consumed；撤单 released。
+    fulfillment/sell/carryover：直接 consumed。
+    退回：consumed 行标记 restored，同额恢复到批次（或新退回批次）。
+    """
+    __tablename__ = "credit_batch_allocations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    group_id = Column(Integer, ForeignKey("credit_batch_selection_groups.id"), nullable=False, index=True)
+    batch_id = Column(Integer, ForeignKey("credit_batches.id"), nullable=False, index=True)
+    enterprise_id = Column(Integer, ForeignKey("enterprises.id"), nullable=False, index=True)
+    purpose = Column(Enum(AllocationPurpose), nullable=False)
+    amount = Column(Float, nullable=False, comment="本行数量")
+    status = Column(Enum(AllocationStatus), default=AllocationStatus.HELD, nullable=False)
+    reason = Column(String(500), comment="本行入选理由")
+    consumed_amount = Column(Float, default=0.0, comment="已随成交消耗数量")
+    released_amount = Column(Float, default=0.0, comment="撤单已释放数量")
+    restored_amount = Column(Float, default=0.0, comment="已退回恢复数量")
+    restore_batch_id = Column(Integer, ForeignKey("credit_batches.id"), nullable=True, comment="退回去向批次")
+    order_id = Column(Integer, ForeignKey("credit_orders.id"), nullable=True, index=True)
+    transaction_id = Column(Integer, ForeignKey("credit_transactions.id"), nullable=True, index=True)
+    source_allocation_id = Column(Integer, ForeignKey("credit_batch_allocations.id"), nullable=True,
+                                  comment="成交行对应的预留行")
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    group = relationship("CreditBatchSelectionGroup", back_populates="allocations")
+    batch = relationship("CreditBatch", foreign_keys=[batch_id])
+    restore_batch = relationship("CreditBatch", foreign_keys=[restore_batch_id])
+
+
+class CreditBatchLedgerEntry(Base):
+    """批次台账流水：批次数量的每一次增减，供审计核对守恒。"""
+    __tablename__ = "credit_batch_ledger_entries"
+
+    id = Column(Integer, primary_key=True, index=True)
+    batch_id = Column(Integer, ForeignKey("credit_batches.id"), nullable=False, index=True)
+    enterprise_id = Column(Integer, ForeignKey("enterprises.id"), nullable=False, index=True)
+    entry_type = Column(String(30), nullable=False,
+                        comment="类型：issue/reserve/release/consume/expire/restore/carryover_out/carryover_in")
+    amount = Column(Float, nullable=False, comment="带符号数量：正为增加可用，负为减少可用")
+    balance_after = Column(Float, nullable=False, comment="记账后批次可用余额")
+    ref_type = Column(String(30))
+    ref_id = Column(Integer)
+    ref_no = Column(String(50))
+    allocation_id = Column(Integer, ForeignKey("credit_batch_allocations.id"), nullable=True)
+    remark = Column(String(500))
+    created_at = Column(DateTime, default=datetime.utcnow)

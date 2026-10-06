@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .config import settings
 from .database import Base, engine
 from .routers import enterprises, vehicle_models, credit_records, credit_transactions, statistics
-from .routers import credit_market, credit_carryover, credit_prediction
+from .routers import credit_market, credit_carryover, credit_prediction, credit_batches
 
 Base.metadata.create_all(bind=engine)
 
@@ -32,6 +32,7 @@ app.include_router(statistics.router, prefix=settings.API_V1_PREFIX)
 app.include_router(credit_market.router, prefix=settings.API_V1_PREFIX)
 app.include_router(credit_carryover.router, prefix=settings.API_V1_PREFIX)
 app.include_router(credit_prediction.router, prefix=settings.API_V1_PREFIX)
+app.include_router(credit_batches.router, prefix=settings.API_V1_PREFIX)
 
 
 @app.get("/", tags=["root"])

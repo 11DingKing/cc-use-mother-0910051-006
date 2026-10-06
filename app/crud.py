@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func, and_, or_
 
 from . import models, schemas
+from . import batch_service
 from .rules import (
     calculate_power_consumption_limit,
     calculate_unit_credit,
@@ -249,6 +250,62 @@ def get_credit_records(
     return query.offset(skip).limit(limit).all()
 
 
+def _issue_batch_for_confirmed_record(db: Session, record: models.CreditRecord) -> None:
+    """积分记录确认后，为正积分核发「当年核发」批次（按记录幂等）。"""
+    if record.total_credit <= 0.01:
+        return
+    existing = db.query(models.CreditBatch).filter(
+        models.CreditBatch.origin_ref_type == "credit_record",
+        models.CreditBatch.origin_ref_id == record.id,
+    ).first()
+    if existing:
+        return
+    vehicle_model = get_vehicle_model(db, record.vehicle_model_id)
+    if not vehicle_model:
+        return
+    batch_service.issue_batch(
+        db,
+        enterprise_id=vehicle_model.enterprise_id,
+        source_year=record.year,
+        amount=record.total_credit,
+        acquisition_method=models.BatchAcquisitionMethod.ANNUAL_ISSUE,
+        valid_from=datetime(record.year, 1, 1),
+        valid_until=datetime(record.year + batch_service.ISSUE_VALID_YEARS, 12, 31, 23, 59, 59),
+        origin_ref_type="credit_record",
+        origin_ref_id=record.id,
+        remark=f"{record.year}年度核算确认核发（车型{vehicle_model.model_code}）",
+        batch_prefix="ISS",
+    )
+
+
+def ensure_annual_batches_issued(db: Session, enterprise_id: int, year: int) -> None:
+    """幂等补发：把企业某年已确认但尚未建批次的正积分记录补成核发批次。
+
+    用于历史数据/直接协议交易前保证批次台账完整，避免可用额口径与核算口径不一致。
+    """
+    records = db.query(models.CreditRecord).join(models.VehicleModel).filter(
+        models.VehicleModel.enterprise_id == enterprise_id,
+        models.CreditRecord.year == year,
+        models.CreditRecord.status == CreditRecordStatus.CONFIRMED,
+        models.CreditRecord.total_credit > 0.01,
+    ).all()
+    for record in records:
+        _issue_batch_for_confirmed_record(db, record)
+    db.flush()
+
+
+def ensure_all_batches_issued(db: Session, enterprise_id: int) -> None:
+    """幂等补发企业全部已确认但尚未建批次的正积分记录（不限年度）。"""
+    records = db.query(models.CreditRecord).join(models.VehicleModel).filter(
+        models.VehicleModel.enterprise_id == enterprise_id,
+        models.CreditRecord.status == CreditRecordStatus.CONFIRMED,
+        models.CreditRecord.total_credit > 0.01,
+    ).all()
+    for record in records:
+        _issue_batch_for_confirmed_record(db, record)
+    db.flush()
+
+
 def update_credit_record_status(
     db: Session, record_id: int, status: CreditRecordStatus
 ) -> Optional[models.CreditRecord]:
@@ -274,6 +331,7 @@ def update_credit_record_status(
     db.refresh(db_record)
 
     if status == CreditRecordStatus.CONFIRMED:
+        _issue_batch_for_confirmed_record(db, db_record)
         vehicle_model = get_vehicle_model(db, db_record.vehicle_model_id)
         if vehicle_model:
             update_annual_summary_with_transactions(
@@ -304,6 +362,7 @@ def batch_update_credit_records_status(
             record.publicized_at = now
         elif status == CreditRecordStatus.CONFIRMED:
             record.confirmed_at = now
+            _issue_batch_for_confirmed_record(db, record)
             vehicle_model = get_vehicle_model(db, record.vehicle_model_id)
             if vehicle_model:
                 updated_enterprise_ids.add(vehicle_model.enterprise_id)
@@ -415,6 +474,16 @@ def create_credit_transaction(
     unit_price = transaction.unit_price or 3000.0
     total_amount = transaction.total_amount or (transaction.credit_amount * unit_price)
 
+    txn_year = datetime.now().year
+    # 卖方按可解释规则选批直接消耗（先确保全部已确认积分已建批次，含历年结转/购入）
+    ensure_all_batches_issued(db, transaction.from_enterprise_id)
+    available = batch_service.get_available_balance(db, transaction.from_enterprise_id)
+    if transaction.credit_amount > available + 0.01:
+        raise ValueError(
+            f"转出企业可用批次积分不足：转出{transaction.credit_amount}，可用{available}"
+            f"（已冻结/已过期数量不可用于交易）"
+        )
+
     db_txn = models.CreditTransaction(
         **transaction.model_dump(exclude={"unit_price", "total_amount"}),
         transaction_no=txn_no,
@@ -422,6 +491,23 @@ def create_credit_transaction(
         total_amount=total_amount
     )
     db.add(db_txn)
+    db.flush()
+
+    _, seller_rows = batch_service.consume_direct(
+        db,
+        enterprise_id=transaction.from_enterprise_id,
+        purpose=models.AllocationPurpose.SELL,
+        amount=transaction.credit_amount,
+        ref_type="transaction",
+        ref_id=db_txn.id,
+        ref_no=db_txn.transaction_no,
+    )
+    for row in seller_rows:
+        row.transaction_id = db_txn.id
+    batch_service.receive_purchase_lines(
+        db, transaction.to_enterprise_id, db_txn, seller_rows
+    )
+
     db.commit()
     db.refresh(db_txn)
     return db_txn
@@ -446,6 +532,13 @@ def match_and_execute_transactions(
     db: Session, year: int, unit_price: float = 3000.0
 ) -> Tuple[List[models.CreditTransaction], float, float]:
     summaries = calculate_all_enterprise_summaries(db, year)
+    # 以批次台账为准钳制可出让量：冻结给未完成挂单、已过期的数量不参与传统撮合
+    for s in summaries:
+        ensure_all_batches_issued(db, s.enterprise_id)
+        available = batch_service.get_available_balance(db, s.enterprise_id)
+        # 可出让量不超过该企业批次可用余额（负积分缺口需求不受影响）
+        if s.credit_surplus > available + 0.01:
+            s.credit_surplus = round(available, 2)
     match_results = match_credit_transactions(summaries, unit_price)
 
     transactions = []
@@ -549,11 +642,14 @@ def create_credit_order(
         raise ValueError("企业不存在")
 
     if order.order_type == OrderType.SELL:
-        summary = calculate_enterprise_credit_summary_v2(
-            db, order.enterprise_id, order.year
-        )
-        if summary and order.total_amount > summary.final_credit_surplus:
-            raise ValueError("挂单数量超过可出售的积分钟余")
+        # 卖单挂出即从批次台账预留：可用额以批次可用余额（不含冻结/过期）为准
+        ensure_annual_batches_issued(db, order.enterprise_id, order.year)
+        available = batch_service.get_available_balance(db, order.enterprise_id)
+        if order.total_amount > available + 0.01:
+            raise ValueError(
+                f"挂单数量超过可出售的批次可用余额：挂单{order.total_amount}，可用{available}"
+                f"（已预留给未完成交易或已过期的数量不可再挂单）"
+            )
 
     order_no = generate_order_no(db)
     expires_at = order.expires_at or (datetime.now() + timedelta(days=90))
@@ -566,6 +662,16 @@ def create_credit_order(
         expires_at=expires_at
     )
     db.add(db_order)
+    db.flush()
+
+    if order.order_type == OrderType.SELL:
+        # 按选批规则冻结批次；失败则整体回滚，不留下无预留的卖单
+        try:
+            batch_service.reserve_for_order(db, db_order)
+        except ValueError:
+            db.rollback()
+            raise
+
     db.commit()
     db.refresh(db_order)
     return db_order
@@ -616,6 +722,24 @@ def update_credit_order(
     if "total_amount" in update_data:
         if update_data["total_amount"] < db_order.filled_amount:
             raise ValueError("挂单总量不能小于已成交数量")
+
+    if "total_amount" in update_data and db_order.order_type == OrderType.SELL:
+        # 卖单改量需要同步调整批次冻结（增量选批、减量释放）
+        old_total = round(db_order.total_amount, 2)
+        new_total = round(update_data["total_amount"], 2)
+        if new_total > old_total:
+            available = batch_service.get_available_balance(db, db_order.enterprise_id)
+            if new_total - old_total > available + 0.01:
+                raise ValueError(
+                    f"加挂数量超过批次可用余额：加挂{round(new_total - old_total, 2)}，可用{available}"
+                )
+        try:
+            batch_service.adjust_reservation(db, db_order, old_total, new_total)
+        except ValueError:
+            db.rollback()
+            raise
+
+    if "total_amount" in update_data:
         db_order.remaining_amount = round(
             update_data["total_amount"] - db_order.filled_amount, 2
         )
@@ -636,6 +760,10 @@ def cancel_credit_order(db: Session, order_id: int) -> Optional[models.CreditOrd
 
     if db_order.status not in [OrderStatus.PENDING, OrderStatus.PARTIAL]:
         raise ValueError("只有待成交或部分成交的订单可以取消")
+
+    # 卖单撤单：释放仍冻结的批次预留（成交部分不动）
+    if db_order.order_type == OrderType.SELL:
+        batch_service.release_reservation(db, db_order)
 
     db_order.status = OrderStatus.CANCELLED
     db_order.updated_at = datetime.utcnow()
@@ -696,6 +824,11 @@ def match_orders_by_id(
         status="completed"
     )
     db.add(db_txn)
+    db.flush()
+
+    # 卖方：该卖单冻结的批次转消耗；买方：按成交行入库市场购入批次（继承有效期/最初核发年度）
+    seller_rows = batch_service.consume_reservation(db, sell_order, db_txn, match_amount)
+    batch_service.receive_purchase_lines(db, buy_order.enterprise_id, db_txn, seller_rows)
 
     sell_order.filled_amount = round(sell_order.filled_amount + match_amount, 2)
     sell_order.remaining_amount = round(sell_order.remaining_amount - match_amount, 2)
@@ -791,10 +924,17 @@ def match_all_pending_orders(
             status="completed"
         )
         db.add(db_txn)
-        transactions.append(db_txn)
+        db.flush()
 
         sell_order = get_credit_order(db, mr.sell_order_id)
         buy_order = get_credit_order(db, mr.buy_order_id)
+
+        # 卖方冻结转消耗；买方按成交行入库市场购入批次
+        seller_rows = batch_service.consume_reservation(db, sell_order, db_txn, credit_amount)
+        batch_service.receive_purchase_lines(
+            db, buy_order.enterprise_id, db_txn, seller_rows
+        )
+        transactions.append(db_txn)
 
         if sell_order:
             sell_order.filled_amount = round(sell_order.filled_amount + credit_amount, 2)
@@ -991,91 +1131,92 @@ def get_credit_carryovers(
     return query.order_by(models.CreditCarryover.created_at.desc()).offset(skip).limit(limit).all()
 
 
+def _create_carryover_row(
+    db: Session, carryover_create: schemas.CreditCarryoverCreate
+) -> models.CreditCarryover:
+    """创建结转单（不提交，供批次结转在同一事务内使用）。"""
+    db_carryover = models.CreditCarryover(
+        **carryover_create.model_dump(),
+        carryover_no=generate_carryover_no(db),
+        used_amount=0.0,
+        remaining_amount=carryover_create.carryover_amount,
+        approved_at=datetime.utcnow()
+    )
+    db.add(db_carryover)
+    db.flush()
+    return db_carryover
+
+
 def execute_yearly_carryover(
     db: Session, from_year: int, to_year: int
 ) -> List[models.CreditCarryover]:
+    """年度结转（批次驱动，逐年链式）。
+
+    对每个相邻年度对 src->tgt：
+    - 从企业「来源年度=src」的可用批次（不含冻结给未完成交易、不含已过期）中选批；
+    - 按1年结转比例(80%)出库，生成 tgt 年度的「历年结转」新批次，并写 CreditBatchLink
+      来源链；新批次 source_year=tgt，可在下一步继续被结转（链式保留完整来源链）；
+    - 结转单 original_amount 记结转前数量，carryover_amount 记政策缩量后数量。
+    """
     enterprises = get_enterprises(db)
-    carryovers = []
+    carryovers: List[models.CreditCarryover] = []
 
     year_diff = to_year - from_year
-    if year_diff > CARRYOVER_MAX_YEARS:
+    if year_diff < 1 or year_diff > CARRYOVER_MAX_YEARS:
         return carryovers
 
     for enterprise in enterprises:
         try:
-            current_year = from_year
-            current_surplus = 0.0
-
-            start_summary = get_or_create_annual_summary(db, enterprise.id, from_year)
-            if not start_summary or start_summary.credit_surplus <= 0.01:
-                continue
-
-            current_surplus = start_summary.credit_surplus
-            total_carryover_ratio = 1.0
-
             for step in range(year_diff):
                 src_year = from_year + step
                 tgt_year = src_year + 1
 
-                src_summary = get_or_create_annual_summary(db, enterprise.id, src_year)
-                tgt_summary = get_or_create_annual_summary(db, enterprise.id, tgt_year)
+                ensure_annual_batches_issued(db, enterprise.id, src_year)
 
-                if step == 0:
-                    amount_to_carry = current_surplus
-                else:
-                    amount_to_carry = tgt_summary.credit_surplus if tgt_summary.credit_surplus > 0.01 else 0.0
-
-                if amount_to_carry <= 0.01:
+                # 结转按业务发生时点（目标年初）判定批次是否仍在有效期
+                business_as_of = datetime(src_year + 1, 1, 1)
+                all_candidates = batch_service.get_available_candidates(db, enterprise.id, business_as_of)
+                candidates = [c for c in all_candidates if c.source_year == src_year]
+                pre_amount = round(sum(c.remaining for c in candidates), 2)
+                if pre_amount <= 0.01:
                     continue
 
-                ratio, carryover_amount = calculate_carryover_amount(
-                    amount_to_carry,
-                    1
-                )
-                total_carryover_ratio *= ratio
-
-                if carryover_amount <= 0.01:
+                ratio, _ = calculate_carryover_amount(pre_amount, 1)
+                post_amount = round(pre_amount * ratio, 2)
+                if post_amount <= 0.01:
                     continue
 
                 carryover_create = schemas.CreditCarryoverCreate(
                     enterprise_id=enterprise.id,
                     from_year=src_year,
                     to_year=tgt_year,
-                    original_amount=amount_to_carry,
+                    original_amount=pre_amount,
                     carryover_ratio=ratio,
-                    carryover_amount=carryover_amount,
-                    remark=f"{src_year}年度结转至{tgt_year}年度，结转比例{int(ratio*100)}%"
+                    carryover_amount=post_amount,
+                    remark=f"{src_year}年度批次结转至{tgt_year}年度，结转比例{int(ratio*100)}%"
                 )
+                db_carryover = _create_carryover_row(db, carryover_create)
 
-                db_carryover = create_credit_carryover(db, carryover_create)
+                child = batch_service.carryover_enterprise_batches(
+                    db,
+                    enterprise_id=enterprise.id,
+                    from_year=src_year,
+                    to_year=tgt_year,
+                    ratio=ratio,
+                    carryover=db_carryover,
+                    candidates=candidates,
+                )
+                if child is None:
+                    raise ValueError("批次结转未生成子批次")
                 carryovers.append(db_carryover)
 
-                src_summary.carryover_out = round(src_summary.carryover_out + carryover_amount, 2)
-                src_summary.credit_surplus = round(src_summary.credit_surplus - carryover_amount, 2)
-                src_summary.final_net_credit = round(src_summary.final_net_credit - carryover_amount, 2)
-                src_summary.updated_at = datetime.utcnow()
-
-                tgt_summary.carryover_in = round(tgt_summary.carryover_in + carryover_amount, 2)
-                tgt_summary.final_net_credit = round(tgt_summary.final_net_credit + carryover_amount, 2)
-
-                if tgt_summary.credit_gap > 0.01:
-                    used_amount = min(carryover_amount, tgt_summary.credit_gap)
-                    db_carryover.used_amount = used_amount
-                    db_carryover.remaining_amount = round(carryover_amount - used_amount, 2)
-                    tgt_summary.credit_gap = round(tgt_summary.credit_gap - used_amount, 2)
-
-                    if tgt_summary.credit_gap <= 0.01:
-                        tgt_summary.is_compliant = True
-                        tgt_summary.credit_surplus = round(abs(tgt_summary.credit_gap), 2)
-                        tgt_summary.credit_gap = 0.0
-                else:
-                    tgt_summary.credit_surplus = round(tgt_summary.credit_surplus + carryover_amount, 2)
-
-                tgt_summary.updated_at = datetime.utcnow()
-
+            db.commit()
+            # 以单据为准重算涉及年度的汇总口径
+            for yr in range(from_year, to_year + 1):
+                update_annual_summary_with_transactions(db, enterprise.id, yr)
             db.commit()
 
-        except Exception as e:
+        except Exception:
             db.rollback()
             continue
 
@@ -1411,3 +1552,105 @@ def update_credit_record(
 
     return db_record
 
+
+
+# ---------------------------------------------------------------------------
+# 积分批次台账：履约 / 退回 / 过期 / 查询解释的业务包装
+# ---------------------------------------------------------------------------
+
+def fulfill_annual_obligation(
+    db: Session, enterprise_id: int, year: int, amount: float,
+    rule_version: str = "v1", remark: Optional[str] = None,
+) -> Dict:
+    """年度履约：按选批规则从可用批次中消耗积分抵偿当年义务。
+
+    履约前幂等补发当年核发批次；已冻结给未完成交易的数量不会被动用。
+    """
+    ensure_annual_batches_issued(db, enterprise_id, year)
+    group, rows = batch_service.consume_direct(
+        db,
+        enterprise_id=enterprise_id,
+        purpose=models.AllocationPurpose.FULFILLMENT,
+        amount=amount,
+        rule_version=rule_version,
+        ref_type="fulfillment",
+        ref_id=year,
+        ref_no=f"FUL{year}",
+    )
+    if remark:
+        group.reason_summary = f"{group.reason_summary} 备注：{remark}"
+    update_annual_summary_with_transactions(db, enterprise_id, year)
+    db.commit()
+    db.refresh(group)
+    return {
+        "group_id": group.id,
+        "group_no": group.group_no,
+        "rule_version": group.rule_version,
+        "amount": round(amount, 2),
+        "allocations": [
+            {
+                "batch_id": r.batch_id,
+                "amount": round(r.amount, 2),
+                "reason": r.reason,
+            } for r in rows
+        ],
+    }
+
+
+def return_credit_transaction(db: Session, transaction_id: int) -> Dict:
+    """退回一笔已完成交易：按原成交行恢复/冲回批次，再重算年度汇总。"""
+    transaction = db.query(models.CreditTransaction).filter(
+        models.CreditTransaction.id == transaction_id
+    ).first()
+    if not transaction:
+        raise ValueError("交易不存在")
+
+    result = batch_service.return_transaction(db, transaction)
+    year = (transaction.transaction_date or datetime.utcnow()).year
+    update_annual_summary_with_transactions(db, transaction.from_enterprise_id, year)
+    update_annual_summary_with_transactions(db, transaction.to_enterprise_id, year)
+    db.commit()
+    return result
+
+
+def expire_due_batches(db: Session, as_of: Optional[datetime] = None) -> List[Dict]:
+    """过期作业：只过期可用部分，冻结给未完成交易的数量保留。"""
+    result = batch_service.expire_batches(db, as_of=as_of)
+    db.commit()
+    return result
+
+
+def preview_batch_selection(
+    db: Session, enterprise_id: int, amount: float, rule_version: str = "v1"
+) -> Dict:
+    """不落库地预览一次消费会选哪些批次及理由。"""
+    from .batch_rules import select_batches
+    candidates = batch_service.get_available_candidates(db, enterprise_id)
+    result = select_batches(candidates, amount, rule_version=rule_version)
+    return {
+        "rule_version": result.rule_version,
+        "rule_description": result.rule_description,
+        "requested_amount": result.requested_amount,
+        "selected_amount": result.selected_amount,
+        "shortfall": result.shortfall,
+        "satisfied": result.is_satisfied,
+        "lines": [
+            {
+                "batch_id": l.batch_id,
+                "batch_no": l.batch_no,
+                "amount": l.amount,
+                "rank": l.rank,
+                "source_year": l.source_year,
+                "origin_year": l.origin_year,
+                "acquisition_method": l.acquisition_method,
+                "valid_until": l.valid_until,
+                "reason": l.reason,
+            } for l in result.lines
+        ],
+        "ranking": [
+            {"rank": r.rank, "batch_no": r.batch_no, "remaining": r.remaining,
+             "chosen": r.chosen, "reason": r.reason}
+            for r in result.ranking
+        ],
+        "excluded": result.excluded,
+    }

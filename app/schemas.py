@@ -516,3 +516,68 @@ class CarryoverSummaryResponse(BaseModel):
 
 
 CreditOrderWithDetail.model_rebuild()
+
+
+# ---------------------------------------------------------------------------
+# 积分批次台账
+# ---------------------------------------------------------------------------
+
+class FulfillmentRequest(BaseModel):
+    enterprise_id: int
+    year: int
+    amount: float = Field(..., gt=0, description="履约消耗数量")
+    rule_version: str = Field("v1", description="选批规则版本")
+    remark: Optional[str] = None
+
+
+class BatchResponse(BaseModel):
+    id: int
+    batch_no: str
+    enterprise_id: int
+    source_year: int
+    origin_year: int
+    acquisition_method: str
+    original_amount: float
+    remaining_amount: float
+    frozen_amount: float
+    consumed_amount: float
+    expired_amount: float
+    valid_from: datetime
+    valid_until: datetime
+    status: str
+    rule_version: str
+    origin_ref_type: Optional[str] = None
+    origin_ref_id: Optional[int] = None
+    parent_batch_id: Optional[int] = None
+    remark: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class BatchBalanceResponse(BaseModel):
+    enterprise_id: int
+    as_of: str
+    available: float
+    frozen: float
+    consumed: float
+    expired: float
+    usable_total: float
+    by_method: dict
+    already_expired_pending_run: List[dict] = []
+
+
+class SelectionPreviewRequest(BaseModel):
+    enterprise_id: int
+    amount: float = Field(..., gt=0)
+    rule_version: str = "v1"
+
+
+class CarryoverBatchExecuteRequest(BaseModel):
+    enterprise_id: Optional[int] = None
+    rule_version: str = "v1"
+
+
+class ReplayRuleRequest(BaseModel):
+    rule_version: str
