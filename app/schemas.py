@@ -1,8 +1,11 @@
-from typing import List, Optional
+from typing import List, Optional, Dict
 from datetime import datetime
 from pydantic import BaseModel, Field
 
-from .models import CreditRecordStatus, OrderType, OrderStatus, CarryoverStatus
+from .models import (
+    CreditRecordStatus, OrderType, OrderStatus, CarryoverStatus,
+    AcquisitionMethod, CreditBatchStatus, AllocationPurpose, AllocationStatus,
+)
 
 
 class EnterpriseBase(BaseModel):
@@ -516,3 +519,96 @@ class CarryoverSummaryResponse(BaseModel):
 
 
 CreditOrderWithDetail.model_rebuild()
+
+
+# ---------------------------------------------------------------------------
+# 积分批次台账
+# ---------------------------------------------------------------------------
+
+class CreditBatchResponse(BaseModel):
+    id: int
+    batch_no: str
+    enterprise_id: int
+    source_year: int
+    acquired_year: int
+    acquisition_method: AcquisitionMethod
+    initial_amount: float
+    remaining_amount: float
+    reserved_amount: float
+    consumed_amount: float
+    expired_amount: float
+    expiry_year: int
+    status: CreditBatchStatus
+    source_type: Optional[str] = None
+    source_id: Optional[int] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class AllocationRuleCreate(BaseModel):
+    version: str = Field(..., max_length=20, description="规则版本号（不可变）")
+    name: str = Field(..., max_length=100, description="规则名称")
+    strategy: str = Field(..., description="选择策略：expiry_first/fifo/source_priority")
+    params: Optional[Dict] = Field(None, description="规则参数（来源优先级、适用期限年限、用途可用来源）")
+    description: Optional[str] = Field(None, max_length=500)
+    activate: bool = Field(False, description="创建后立即启用")
+
+
+class AllocationRuleResponse(BaseModel):
+    id: int
+    version: str
+    name: str
+    strategy: str
+    params: Dict
+    is_active: bool
+    description: Optional[str] = None
+    created_at: datetime
+
+
+class BatchAllocationItemResponse(BaseModel):
+    id: int
+    batch_id: int
+    batch_no: Optional[str] = None
+    amount: float
+    remaining_before: Optional[float] = None
+    remaining_after: Optional[float] = None
+    reason: Optional[str] = None
+
+
+class BatchAllocationResponse(BaseModel):
+    id: int
+    allocation_no: str
+    enterprise_id: int
+    purpose: AllocationPurpose
+    year: int
+    total_amount: float
+    rule_version: Optional[str] = None
+    status: AllocationStatus
+    reference_type: Optional[str] = None
+    reference_id: Optional[int] = None
+    reverses_allocation_id: Optional[int] = None
+    explanation: Optional[str] = None
+    created_at: datetime
+    reversed_at: Optional[datetime] = None
+    items: List[BatchAllocationItemResponse] = []
+
+
+class ComplianceFulfillRequest(BaseModel):
+    enterprise_id: int
+    year: int = Field(..., description="履约年度")
+    amount: Optional[float] = Field(None, gt=0, description="履约数量，缺省按当前缺口全额履约")
+
+
+class ExpireBatchesRequest(BaseModel):
+    as_of_year: int = Field(..., description="截至年度：适用期限早于该年度的批次按过期处理")
+    enterprise_id: Optional[int] = Field(None, description="限定企业，缺省处理全部企业")
+
+
+class ReverseAllocationRequest(BaseModel):
+    reason: Optional[str] = Field(None, max_length=500, description="退回原因")
+
+
+class ReplayAllocationRequest(BaseModel):
+    rule_version: Optional[str] = Field(None, description="指定重放使用的规则版本，缺省按原规则")

@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 from sqlalchemy import func, and_, or_
 
-from . import models, schemas
+from . import models, schemas, batch_service
 from .rules import (
     calculate_power_consumption_limit,
     calculate_unit_credit,
@@ -279,6 +279,10 @@ def update_credit_record_status(
             update_annual_summary_with_transactions(
                 db, vehicle_model.enterprise_id, db_record.year
             )
+        # 确认后正积分按批次核发入账（幂等）
+        batch_service.create_issued_batch_for_record(db, db_record)
+        db.commit()
+        db.refresh(db_record)
 
     return db_record
 
@@ -293,6 +297,7 @@ def batch_update_credit_records_status(
     now = datetime.utcnow()
     count = 0
     updated_enterprise_ids = set()
+    confirmed_records = []
 
     for record in records:
         is_valid, _ = validate_status_transition(record.status, status)
@@ -304,6 +309,7 @@ def batch_update_credit_records_status(
             record.publicized_at = now
         elif status == CreditRecordStatus.CONFIRMED:
             record.confirmed_at = now
+            confirmed_records.append(record)
             vehicle_model = get_vehicle_model(db, record.vehicle_model_id)
             if vehicle_model:
                 updated_enterprise_ids.add(vehicle_model.enterprise_id)
@@ -314,6 +320,12 @@ def batch_update_credit_records_status(
 
     for enterprise_id in updated_enterprise_ids:
         update_annual_summary_with_transactions(db, enterprise_id, year)
+
+    # 确认后正积分按批次核发入账（幂等）
+    for record in confirmed_records:
+        batch_service.create_issued_batch_for_record(db, record)
+    if confirmed_records:
+        db.commit()
 
     return count
 
@@ -424,6 +436,14 @@ def create_credit_transaction(
     db.add(db_txn)
     db.commit()
     db.refresh(db_txn)
+
+    # 出售核销卖方批次并为买方建立购入批次（无台账的存量数据自动跳过）
+    txn_year = db_txn.transaction_date.year if db_txn.transaction_date else datetime.now().year
+    batch_service.consume_for_sale(
+        db, transaction=db_txn, amount=db_txn.credit_amount, year=txn_year
+    )
+    db.commit()
+    db.refresh(db_txn)
     return db_txn
 
 
@@ -448,24 +468,43 @@ def match_and_execute_transactions(
     summaries = calculate_all_enterprise_summaries(db, year)
     match_results = match_credit_transactions(summaries, unit_price)
 
+    # 批次台账口径：实际可转让量不超过卖方批次可用余额（无台账的存量数据不限制）
+    available_budget: Dict[int, Optional[float]] = {}
     transactions = []
+    total_matched = 0.0
+    total_transferred = 0.0
     for mr in match_results:
+        total_matched = round(total_matched + mr.credit_amount, 2)
+        seller_id = mr.from_enterprise_id
+        if seller_id not in available_budget:
+            available_budget[seller_id] = batch_service.get_available_balance(db, seller_id)
+        budget = available_budget[seller_id]
+        transfer = round(mr.credit_amount, 2) if budget is None else round(min(mr.credit_amount, budget), 2)
+        if transfer <= 0.01:
+            continue
+        if budget is not None:
+            available_budget[seller_id] = round(budget - transfer, 2)
+
         txn = schemas.CreditTransactionCreate(
             from_enterprise_id=mr.from_enterprise_id,
             to_enterprise_id=mr.to_enterprise_id,
-            credit_amount=round(mr.credit_amount, 2),
+            credit_amount=transfer,
             unit_price=round(mr.unit_price, 2),
-            total_amount=round(mr.total_amount, 2),
+            total_amount=round(transfer * mr.unit_price, 2),
             remark=f"{year}年度双积分自动撮合交易"
         )
         db_txn = create_credit_transaction(db, txn)
         transactions.append(db_txn)
+        total_transferred = round(total_transferred + transfer, 2)
         update_annual_summary_after_transaction(db, db_txn, year)
 
+    not_executed = round(total_matched - total_transferred, 2)
     remaining_gap = sum(round(s.credit_gap, 2) for s in summaries if s.credit_gap > 0.01)
     remaining_surplus = sum(round(s.credit_surplus, 2) for s in summaries if s.credit_surplus > 0.01)
+    remaining_gap = round(remaining_gap + not_executed, 2)
+    remaining_surplus = round(remaining_surplus + not_executed, 2)
 
-    return transactions, round(remaining_gap, 2), round(remaining_surplus, 2)
+    return transactions, remaining_gap, remaining_surplus
 
 
 def get_suspicious_weight_models(db: Session) -> List[models.VehicleModel]:
@@ -566,6 +605,16 @@ def create_credit_order(
         expires_at=expires_at
     )
     db.add(db_order)
+    db.flush()
+
+    if db_order.order_type == OrderType.SELL:
+        try:
+            # 挂单即按规则预留批次，未完成交易的数量自此锁定
+            batch_service.reserve_for_order(db, db_order)
+        except ValueError:
+            db.rollback()
+            raise
+
     db.commit()
     db.refresh(db_order)
     return db_order
@@ -613,15 +662,27 @@ def update_credit_order(
         if not is_valid:
             raise ValueError(error_msg)
 
+    reserve_delta = 0.0
     if "total_amount" in update_data:
         if update_data["total_amount"] < db_order.filled_amount:
             raise ValueError("挂单总量不能小于已成交数量")
-        db_order.remaining_amount = round(
-            update_data["total_amount"] - db_order.filled_amount, 2
-        )
+        new_remaining = round(update_data["total_amount"] - db_order.filled_amount, 2)
+        reserve_delta = round(new_remaining - db_order.remaining_amount, 2)
+        db_order.remaining_amount = new_remaining
 
     for key, value in update_data.items():
         setattr(db_order, key, value)
+
+    # 卖单改量同步调整批次预留：增量补预留，减量按预留记录释放
+    if db_order.order_type == OrderType.SELL and abs(reserve_delta) > 0.005:
+        try:
+            if reserve_delta > 0:
+                batch_service.reserve_for_order(db, db_order, amount=reserve_delta)
+            else:
+                batch_service.release_for_order(db, db_order, amount=-reserve_delta)
+        except ValueError:
+            db.rollback()
+            raise
 
     db_order.updated_at = datetime.utcnow()
     db.commit()
@@ -636,6 +697,10 @@ def cancel_credit_order(db: Session, order_id: int) -> Optional[models.CreditOrd
 
     if db_order.status not in [OrderStatus.PENDING, OrderStatus.PARTIAL]:
         raise ValueError("只有待成交或部分成交的订单可以取消")
+
+    # 撤单：按预留记录原路释放批次（无预留的存量订单自动跳过）
+    if db_order.order_type == OrderType.SELL:
+        batch_service.release_for_order(db, db_order)
 
     db_order.status = OrderStatus.CANCELLED
     db_order.updated_at = datetime.utcnow()
@@ -696,6 +761,17 @@ def match_orders_by_id(
         status="completed"
     )
     db.add(db_txn)
+    db.flush()
+
+    # 成交核销：优先按卖单预留记录原路核销，并为买方建立购入批次
+    try:
+        batch_service.consume_for_sale(
+            db, transaction=db_txn, amount=match_amount,
+            year=sell_order.year, sell_order=sell_order
+        )
+    except ValueError as e:
+        db.rollback()
+        return None, str(e)
 
     sell_order.filled_amount = round(sell_order.filled_amount + match_amount, 2)
     sell_order.remaining_amount = round(sell_order.remaining_amount - match_amount, 2)
@@ -791,10 +867,18 @@ def match_all_pending_orders(
             status="completed"
         )
         db.add(db_txn)
+        db.flush()
         transactions.append(db_txn)
 
         sell_order = get_credit_order(db, mr.sell_order_id)
         buy_order = get_credit_order(db, mr.buy_order_id)
+
+        # 成交核销：优先按卖单预留记录原路核销，并为买方建立购入批次
+        if sell_order:
+            batch_service.consume_for_sale(
+                db, transaction=db_txn, amount=credit_amount,
+                year=year, sell_order=sell_order
+            )
 
         if sell_order:
             sell_order.filled_amount = round(sell_order.filled_amount + credit_amount, 2)
@@ -957,6 +1041,15 @@ def create_credit_carryover(
         approved_at=datetime.utcnow()
     )
     db.add(db_carryover)
+    db.flush()
+
+    # 结转落地：来源批次转出消耗，生成结转新批次并保留来源链（幂等）
+    try:
+        batch_service.apply_carryover(db, db_carryover)
+    except ValueError:
+        db.rollback()
+        raise
+
     db.commit()
     db.refresh(db_carryover)
     return db_carryover
@@ -1062,6 +1155,18 @@ def execute_yearly_carryover(
                     used_amount = min(carryover_amount, tgt_summary.credit_gap)
                     db_carryover.used_amount = used_amount
                     db_carryover.remaining_amount = round(carryover_amount - used_amount, 2)
+
+                    # 结转积分落地即定向抵偿缺口：从结转新批次中核销
+                    carry_batch = batch_service.get_batch_for_source(
+                        db, "credit_carryover", db_carryover.id
+                    )
+                    if carry_batch is not None:
+                        batch_service.consume_compliance_from_batch(
+                            db, carry_batch, used_amount, tgt_year,
+                            reference_type="credit_carryover",
+                            reference_id=db_carryover.id,
+                        )
+
                     tgt_summary.credit_gap = round(tgt_summary.credit_gap - used_amount, 2)
 
                     if tgt_summary.credit_gap <= 0.01:
@@ -1146,6 +1251,8 @@ def update_annual_summary_with_transactions(
     bought = 0.0
     sold = 0.0
     for txn in transactions:
+        if txn.status == "returned":
+            continue  # 已退回的交易不计入成交口径
         txn_year = txn.transaction_date.year if txn.transaction_date else year
         if txn_year == year:
             if txn.to_enterprise_id == enterprise_id:
@@ -1175,16 +1282,21 @@ def update_annual_summary_with_transactions(
         - summary.sold_credit
         - summary.carryover_out
     )
+    # 批次台账口径：挂单预留与已过期部分不再计入可用额；
+    # 履约核销对净头寸中性（以持有积分抵偿义务），但计入达标判定
+    fulfilled = batch_service.get_compliance_fulfilled_total(db, enterprise_id, year)
+    reserved = batch_service.get_reserved_total(db, enterprise_id)
+    expired = batch_service.get_expired_total(db, enterprise_id)
+    available_credit = available_credit - reserved - expired
     summary.final_net_credit = round(available_credit, 2)
 
     if available_credit >= 0:
         summary.credit_gap = 0.0
         summary.credit_surplus = round(available_credit, 2)
-        summary.is_compliant = True
     else:
         summary.credit_gap = round(abs(available_credit), 2)
         summary.credit_surplus = 0.0
-        summary.is_compliant = False
+    summary.is_compliant = (summary.credit_gap - fulfilled) <= 0.01
 
     summary.updated_at = datetime.utcnow()
     db.commit()
